@@ -1,8 +1,8 @@
 import numpy as np
 from typing import Tuple, Optional, Sequence
 
-# CONSTANTS
-GAMMABAR  = 42.577130 # Hz/G
+# Gyromagnetic ratio [rad / (ms * mT)]
+gyroMagnRatio = 267.513e-6
 
 def normalize_shells(shells: np.ndarray) -> Tuple[np.ndarray, int]:
     """
@@ -119,7 +119,7 @@ def normalize_gradients(gradients) -> Tuple[Optional[np.ndarray], int]:
         "Expected (N_dir, 3) or (3, N_dir)."
     )
 
-def calc_bval(G, pulse_duration, diffusion_time, t_ramp=0):
+def calc_bval(G, pulse_duration, diffusion_time):
     """
     Calculate B given diffusion times and G
     pulse_duration/diffusion_time must be in ms
@@ -133,9 +133,4 @@ def calc_bval(G, pulse_duration, diffusion_time, t_ramp=0):
     Returns:
         numpy array or float (Unit ms/mu^2)
     """
-    pulse_duration_s = pulse_duration / 1000  # ms --> s
-    Delta_s = diffusion_time / 1000  # ms --> s
-    t_ramp_s = t_ramp / 1000  # ms --> s
-    del_term = (pulse_duration_s ** 2. * (Delta_s - pulse_duration_s / 3) + t_ramp_s ** 3 / 30 - pulse_duration_s * (
-            t_ramp_s ** 2) / 6)
-    return G ** 2 * (4 * np.pi ** 2 * GAMMABAR ** 2) * del_term / 1e3
+    return (G * gyroMagnRatio * pulse_duration)** 2 * (diffusion_time - pulse_duration/3)
