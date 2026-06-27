@@ -1,6 +1,6 @@
 from .base import Parameter, BaseCompartment
 import numpy as np
-from .utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
+from .compartment_utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
 from typing import Any
 
 # Constants:
@@ -49,6 +49,7 @@ class Sphere(BaseCompartment):
 
         shells_raw = params["shells"]
         shells_arr, n_shells = normalize_shells(shells_raw)
+        G_all, Delta_all, delta_all = shells_arr
 
         if "g_dirs" not in params:
             raise ValueError(
@@ -79,108 +80,77 @@ class Sphere(BaseCompartment):
                 f"Missing microstructural parameters D and/or radius for compartment '{self.name}'. "
                 f"Pass them when instantiating the object."
             )
+        
+        radius = np.atleast_1d(radius).astype(float)
+        D = np.atleast_1d(D).astype(float)
 
-        # ---- 5. Compute the signal shape ----
-        # Internal axis order: (n_shells, n_TE, n_dirs)
-        # If TE_arr is None: treat n_TE = 1 but you can omit decay or set TE=0
+        if np.isscalar(T2) or T2 is None:
+            if T2 is None:
+                T2_arr = None
+                n_T2 = 1
+            else:
+                T2_arr = np.atleast_1d(float(T2))         # shape (1,)
+                n_T2 = 1
+        else:
+            T2_arr = np.atleast_1d(T2).astype(float)      # shape (n_T2,)
+            n_T2 = T2_arr.size
 
-        signal = np.zeros((n_shells, n_TE, n_dirs), dtype=float)
-
-        for i_shell in range(n_shells):
-            shell_info = shells_arr[:, i_shell]  # shape (3,)
-            G, Delta, delta = shell_info 
-            for i_TE in range(n_TE):
-                TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                for i_dir in range(n_dirs):
-                    G_T_per_micron = G * 1e-3 * 1e-6  # [T] * [um]^-1
-                    am_r = am[:, np.newaxis] / radius
-                    GPDsum = compute_GPDsum(am_r,delta,Delta,D,radius)
-                    attenuation = np.exp(-2. * gamma_ms ** 2 * G_T_per_micron ** 2 * GPDsum)
-                    if T2 is None:
-                        signal[i_shell,i_TE,i_dir] = attenuation
-                    else:
-                        T2_decay = np.exp(-TE_val/T2)
-                        signal[i_shell,i_TE,i_dir] = attenuation * T2_decay
-
-        # remove dimensions of length 1
-        return np.squeeze(signal)
-    
-    def predict_mean(self, **params: Any) -> np.ndarray:
-        """
-        Expected keys in params:
-            - shells (required): (3, N) array
-            - TE (optional): scalar or 1D
-
-        Also includes microstructural params:
-            - D
-            - Radius
-            - T2 (may be None)
-        """
-
-        # ---- 1. Required 'shells' argument ----
-        if "shells" not in params:
-            raise ValueError(
-                f"'shells' argument is required in predict_mean() for {self.name}"
-            )
-        shells_raw = params["shells"]
-        shells_arr, n_shells = normalize_shells(shells_raw)
-
-        # For restricted compartments, we require (3, N)
-        if shells_arr.ndim != 2 or shells_arr.shape[0] != 3:
-            raise ValueError(
-                f"'shells' must be a 2D array of shape (3, N) with rows [G, diffusion_time, pulse_duration] "
-                f"for compartment '{self.name}'. Got shape {shells_arr.shape}."
-            )
-
-        if "g_dirs" in params:
-            raise ValueError(
-                f"'g_dirs' argument only valid when predict() is called for {self.name}"
-            )
-
-        # ---- 2. TE handling, conditioned on T2 ----
-        T2 = self.values.get("T2", None)  # from self.values unless overridden
-        TE_raw = params.get("TE", None)
-
-        if T2 is not None and TE_raw is None:
-            raise ValueError(
-                f"Compartment '{self.name}' requires TE when T2 is specified."
-            )
-
-        TE_arr, n_TE = normalize_TE(TE_raw, n_shells)
-
-        # ---- 4. Extract microstructural parameters ----
-        # allow override via params, otherwise use instance values
-        radius = self.values.get("radius",None)
-        D = self.values.get("D",None)
-
-        if radius is None or D is None:
-            raise ValueError(
-                f"Missing microstructural parameters D and/or radius for compartment '{self.name}'. "
-                f"Pass them when instantiating the object."
-            )
+        n_radii = radius.size
+        n_Ds = D.size
         
         # ---- 5. Compute the signal shape ----
         # Internal axis order: (n_shells, n_TE, n_dirs)
         # If TE_arr is None: treat n_TE = 1 but you can omit decay or set TE=0
 
-        signal = np.zeros((n_shells, n_TE), dtype=float)
+        # Precompute per-shell quantities
 
-        for i_shell in range(n_shells):
-            shell_info = shells_arr[:, i_shell]  # shape (3,)
-            G, Delta, delta = shell_info 
-            for i_TE in range(n_TE):
-                TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                G_T_per_micron = G * 1e-3 * 1e-6  # [T] * [um]^-1
-                am_r = am[:, np.newaxis] / radius
-                GPDsum = compute_GPDsum(am_r,delta,Delta,D,radius)
-                attenuation = np.exp(-2. * gamma_ms ** 2 * G_T_per_micron ** 2 * GPDsum)
-                if T2 is None:
-                    signal[i_shell,i_TE] = attenuation
-                else:
-                    T2_decay = np.exp(-TE_val/T2)
-                    signal[i_shell,i_TE] = attenuation * T2_decay
+        # G_all, Delta_all, delta_all: (n_shells,)
+        G_T_per_micron_all = G_all * 1e-3 * 1e-6   # (n_shells,)
+        G_T_all = G_T_per_micron_all               # name alias for clarity
 
-        # remove dimensions of length 1
+        # Reshape to broadcast as (..., n_shells,...)
+        G_T_b = G_T_all[None, None, None, :, None, None]  # (1,1,1,1,n_shells,1,1)
+
+        # Precompute GPDsum
+        radius_b = radius[:, None, None]            # (n_radii, 1, 1)
+        D_b = D[None, :, None]                      # (1, n_Ds, 1)
+        delta_b = delta_all[None, None, :]          # (1, 1, n_shells)
+        Delta_b = Delta_all[None, None, :]          # (1, 1, n_shells)
+
+        GPDsum = compute_GPDsum_broadcast(radius_b, D_b, delta_b, Delta_b)
+        # GPDsum: (n_radii, n_Ds, n_shells)
+
+        # Reshape for final broadcasting:
+        GPDsum_b = GPDsum[:, :, None, :, None, None]
+        # -> (n_radii, n_Ds, 1, 1, n_shells, 1, 1)
+
+        log_att = -2. * gamma_ms ** 2 * G_T_b ** 2 * GPDsum_b
+
+        # --- 9. T2 decay broadcasting ---
+
+        if T2_arr is None:
+            # no T2 decay
+            signal = np.exp(log_att)
+        else:
+            # T2_arr: (n_T2,)
+            # TE_arr: (n_TE,)
+            # want T2_decay: (n_T2, n_shells, n_TE)
+            T2_arr_b = T2_arr[:, None, None]          # (n_T2, 1, 1)
+            TE_arr_b = TE_arr[None, None, :]          # (1, 1, n_TE)
+
+            # TE may differ per shell; if normalize_TE already handles this
+            # and TE_arr is actually (n_shells, n_TE), just adapt shapes.
+            # Assuming TE_arr: (n_TE,) same for all shells:
+            T2_decay = np.exp(-TE_arr_b / T2_arr_b)   # (n_T2, 1, n_TE)
+
+            # Broadcast to full shape:
+            T2_decay_b = T2_decay[None, None, :, None, :, None]
+            # (1,1,1,n_T2,1,n_TE,1)
+
+            signal = np.exp(log_att) * T2_decay_b
+        
+        signal = np.repeat(signal, n_dirs, axis=-1)
+
         return np.squeeze(signal)
     
 # From Camino source
@@ -217,3 +187,67 @@ def compute_GPDsum(am_r, pulse_duration, diffusion_time, diffusivity, radius):
     nom = 2 * dam * pulse_duration - 2 + (2 * np.exp(e11)) + (2 * np.exp(e2)) - np.exp(e3) - np.exp(e4)
     denom = dam ** 2 * am_r ** 2 * (radius ** 2 * am_r ** 2 - 2)
     return np.sum(nom / denom)
+
+def compute_GPDsum_broadcast(radius, diffusivity, pulse_duration, diffusion_time):
+    """
+    radius        : (n_radii, 1, 1)      # in µm
+    diffusivity   : (1, n_D, 1)          # in µm^2/ms
+    pulse_duration: (1, 1, n_shells)     # delta, in ms
+    diffusion_time: (1, 1, n_shells)     # Delta, in ms
+
+    Returns:
+        GPDsum: (n_radii, n_D, n_shells)
+    """
+
+    # radius: (n_radii, 1, 1)
+    # diffusivity: (1, n_D, 1)
+    # pulse_duration, diffusion_time: (1, 1, n_shells)
+    #
+    # Build am_r = am / radius with a root axis at the end.
+
+    # am: (n_roots,) -> (1, 1, 1, n_roots)
+    am_vec = am[None, None, None, :]
+
+    # radius: (n_radii, 1, 1) -> (n_radii, 1, 1, 1)
+    radius4 = radius[..., None]
+
+    # am_r: (n_radii, 1, 1, n_roots)
+    am_r = am_vec / radius4
+
+    # diffusivity: (1, n_D, 1) -> (1, n_D, 1, 1)
+    D4 = diffusivity[..., None]
+
+    # pulse_duration, diffusion_time: (1, 1, n_shells) -> (1, 1, n_shells, 1)
+    delta4 = pulse_duration[..., None]
+    Delta4 = diffusion_time[..., None]
+
+    # dam: (n_radii, n_D, n_shells, n_roots)
+    dam = D4 * (am_r**2)
+
+    e11 = -dam * delta4
+    e2  = -dam * Delta4
+    dif = diffusion_time[..., None] - pulse_duration[..., None]  # or Delta4 - delta4
+    e3  = -dam * dif
+    plus = Delta4 + delta4
+    e4  = -dam * plus
+
+    nom = (
+        2.0 * dam * delta4
+        - 2.0
+        + 2.0 * np.exp(e11)
+        + 2.0 * np.exp(e2)
+        - np.exp(e3)
+        - np.exp(e4)
+    )
+
+    # denom: uses am_r and radius exactly as in scalar version
+    denom = (
+        dam**2
+        * am_r**2
+        * (radius4**2 * am_r**2 - 2.0)
+    )
+
+    GPDsum = np.sum(nom / denom, axis=-1)  # sum over roots
+    # shape: (n_radii, n_D, n_shells)
+
+    return GPDsum

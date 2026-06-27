@@ -87,7 +87,9 @@ def normalize_gradients(gradients) -> Tuple[Optional[np.ndarray], int]:
 
     Allowed forms:
         - None: return (None, 1)  # spherical mean, no direction axis
-        - 2D array with shape (N_dir, 3) or (3, N_dir)
+        - 1D array with shape (3,)           -> single direction
+        - 2D array with shape (N_dir, 3)     -> N_dir directions
+        - 2D array with shape (3, N_dir)     -> N_dir directions (transpose)
 
     Returns:
         grad_arr, n_dirs
@@ -98,17 +100,31 @@ def normalize_gradients(gradients) -> Tuple[Optional[np.ndarray], int]:
         return None, 1
 
     grad_arr = np.asarray(gradients)
+
+    # --- Single direction: shape (3,) ---
+    if grad_arr.ndim == 1:
+        if grad_arr.shape[0] != 3:
+            raise ValueError(
+                f"Invalid gradients shape {grad_arr.shape}. "
+                "Expected 1D array of length 3 for a single direction."
+            )
+        grad_arr = grad_arr.reshape(1, 3)  # -> (1, 3)
+        n_dirs = 1
+        return grad_arr, n_dirs
+
+    # --- Multiple directions: 2D ---
     if grad_arr.ndim != 2:
         raise ValueError(
             f"Invalid gradients dimension {grad_arr.ndim}. "
-            "Expected 2D array with shape (N_dir, 3) or (3, N_dir)."
+            "Expected 1D (3,) or 2D array with shape (N_dir, 3) or (3, N_dir)."
         )
 
     if grad_arr.shape[1] == 3:
         # (N_dir, 3) OK
         n_dirs = grad_arr.shape[0]
         return grad_arr, n_dirs
-    elif grad_arr.shape[0] == 3:
+
+    if grad_arr.shape[0] == 3:
         # (3, N_dir) -> transpose
         grad_arr = grad_arr.T
         n_dirs = grad_arr.shape[0]
@@ -116,7 +132,7 @@ def normalize_gradients(gradients) -> Tuple[Optional[np.ndarray], int]:
 
     raise ValueError(
         f"Invalid gradients shape {grad_arr.shape}. "
-        "Expected (N_dir, 3) or (3, N_dir)."
+        "Expected 1D (3,), (N_dir, 3), or (3, N_dir)."
     )
 
 def calc_bval(G, pulse_duration, diffusion_time):

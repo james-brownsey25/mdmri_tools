@@ -1,7 +1,7 @@
 import numpy as np
 from scipy import special
 from .base import Parameter, BaseCompartment
-from .utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
+from .compartment_utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
 from typing import Any
 
 class Stick(BaseCompartment):
@@ -16,6 +16,7 @@ class Stick(BaseCompartment):
     name = 'stick'
     parameters = (
         Parameter("D_ax", unit="um^2/ms", required=True),
+        Parameter("dir", unit="", required=False, default_value=np.array([0,0,1])),
         Parameter("T2", unit="ms", required=False, default_value=None),
     )
 
@@ -28,6 +29,7 @@ class Stick(BaseCompartment):
 
         Also includes microstructural params:
             - D_ax
+            - Direction
             - T2 (may be None)
         """
 
@@ -36,6 +38,7 @@ class Stick(BaseCompartment):
             raise ValueError(
                 f"'shells' argument is required in predict() for {self.name}"
             )
+        
         shells_raw = params["shells"]
         shells_arr, n_shells = normalize_shells(shells_raw)
 
@@ -61,57 +64,84 @@ class Stick(BaseCompartment):
         # ---- 4. Extract microstructural parameters ----
         # allow override via params, otherwise use instance values
         D_ax = self.values.get("D_ax",None)
+        dirs_raw = self.values.get("dir")
+
+        stick_dirs_arr, n_stick_dirs = normalize_gradients(dirs_raw)
 
         if D_ax is None:
             raise ValueError(
                 f"Missing microstructural parameters D_ax for compartment '{self.name}'. "
                 f"Pass them when instantiating the object."
                 )
-
-        # ---- 5. Compute the signal shape ----
-        # Internal axis order: (n_shells, n_TE, n_dirs)
-        # If TE_arr is None: treat n_TE = 1 but you can omit decay or set TE=0
-
-        signal = np.zeros((n_shells, n_TE, n_dirs), dtype=float)
         
-        # --- Case 1: shells_arr is 1D → b-values
-        if shells_arr.ndim == 1:
-            for i_shell in range(n_shells):
-                b_val = shells_arr[i_shell]
-                for i_TE in range(n_TE):
-                    TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                    for i_dir in range(n_dirs):
-                        b_vec = grad_arr[i_dir]
-                        attenuation = np.exp(-D_ax * b_val * b_vec[..., 2] ** 2)
-                        if T2 is None:
-                            signal[i_shell,i_TE,i_dir] = attenuation
-                        else:
-                            T2_decay = np.exp(-TE_val/T2)
-                            signal[i_shell,i_TE,i_dir] = attenuation * T2_decay
+        D_ax = np.atleast_1d(D_ax).astype(float)
 
-        # --- Case 2: shells_arr is (3, N) → [G, Δ, δ]
-        elif shells_arr.ndim == 2:
-            for i_shell in range(n_shells):
-                G = shells_arr[0, i_shell]
-                Delta = shells_arr[1, i_shell]
-                delta = shells_arr[2, i_shell]
-                b_val = calc_bval(G, delta, Delta)  # note arg order in your calc_bval
-
-                for i_TE in range(n_TE):
-                    TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                    for i_dir in range(n_dirs):
-                        b_vec = grad_arr[i_dir]
-                        attenuation = np.exp(-D_ax * b_val * b_vec[..., 2] ** 2)
-                        if T2 is None:
-                            signal[i_shell,i_TE,i_dir] = attenuation
-                        else:
-                            T2_decay = np.exp(-TE_val/T2)
-                            signal[i_shell,i_TE,i_dir] = attenuation * T2_decay
-
+        if np.isscalar(T2) or T2 is None:
+            if T2 is None:
+                T2_arr = None
+                n_T2 = 1
+            else:
+                T2_arr = np.atleast_1d(float(T2))         # shape (1,)
+                n_T2 = 1
         else:
-            raise RuntimeError(
-                f"normalize_shells returned unexpected ndim={shells_arr.ndim}"
-            )
+            T2_arr = np.atleast_1d(T2).astype(float)      # shape (n_T2,)
+            n_T2 = T2_arr.size
+
+        n_Ds = D_ax.size
+
+        # Precompute direction-related terms
+        # Normalize cylinder directions (just in case)
+        stick_norm = np.linalg.norm(stick_dirs_arr, axis=1, keepdims=True) + 1e-12
+        stick_dirs_unit = stick_dirs_arr / stick_norm  # (n_cyl_dirs, 3)
+
+        # Dot product between cyl_dirs_unit (k,3) and grad_arr (n_dirs,3)
+        # -> (k, n_dirs) via einsum:
+        cos_theta = np.einsum("kd,nd->kn", stick_dirs_unit, grad_arr)
+        c2 = cos_theta**2            # (n_cyl_dirs, n_dirs)
+        s2 = 1.0 - c2                # (n_cyl_dirs, n_dirs)
+
+        # Broadcast to final shape:
+        # We need (1, 1, n_cyl_dirs, 1, 1, 1, n_dirs)
+        c2_b = c2[None, :, None, None, None, :]     # (1, 1, k, 1, 1, 1, n_dirs)
+        s2_b = s2[None, :, None, None, None, :]     # same
+
+        # log_att = -b * D * c2
+        D_b_full = D_ax[:, None, None, None, None, None]
+        # -> (1, n_Ds, 1, 1, 1, 1, 1)
+
+        if shells_arr.ndim == 1:
+            b_b = shells_arr[None, None, None, :, None, None]      # same
+
+        elif shells_arr.ndim == 2:
+            G_all, Delta_all, delta_all = shells_arr
+            b_all = calc_bval(G_all, delta_all, Delta_all) 
+            b_b = b_all[None, None, None, :, None, None]
+        
+        log_att = -b_b * D_b_full * c2_b
+        # -> (n_Ds, n_stick_dirs, 1, n_shells, 1, n_dirs) via broadcast
+
+        # --- 9. T2 decay broadcasting ---
+
+        if T2_arr is None:
+            # no T2 decay
+            signal = np.exp(log_att)
+        else:
+            # T2_arr: (n_T2,)
+            # TE_arr: (n_TE,)
+            # want T2_decay: (n_T2, n_shells, n_TE)
+            T2_arr_b = T2_arr[:, None, None]          # (n_T2, 1, 1)
+            TE_arr_b = TE_arr[None, None, :]          # (1, 1, n_TE)
+
+            # TE may differ per shell; if normalize_TE already handles this
+            # and TE_arr is actually (n_shells, n_TE), just adapt shapes.
+            # Assuming TE_arr: (n_TE,) same for all shells:
+            T2_decay = np.exp(-TE_arr_b / T2_arr_b)   # (n_T2, 1, n_TE)
+
+            # Broadcast to full shape:
+            T2_decay_b = T2_decay[None, None, :, None, :, None]
+            # (1,1,n_T2,1,n_TE,1)
+
+            signal = np.exp(log_att) * T2_decay_b
 
         return np.squeeze(signal)
     

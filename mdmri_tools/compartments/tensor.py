@@ -3,7 +3,7 @@ from scipy import special
 from scipy.special import i0  # I_0 Bessel
 from scipy.integrate import quad
 from .base import Parameter, BaseCompartment
-from .utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
+from .compartment_utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
 from typing import Any
 
 class Tensor(BaseCompartment):

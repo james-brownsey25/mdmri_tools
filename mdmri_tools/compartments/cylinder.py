@@ -1,6 +1,6 @@
 from .base import Parameter, BaseCompartment
 import numpy as np
-from .utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
+from .compartment_utils import normalize_shells, normalize_TE, normalize_gradients, calc_bval
 from typing import Any
 from scipy.integrate import quad
 
@@ -21,6 +21,7 @@ class Cylinder(BaseCompartment):
     parameters = (
         Parameter("D", unit='um^2/ms', required=True),
         Parameter("radius", unit='um', required=True),
+        Parameter("dir", unit="", required = False, default_value=np.array([0,0,1])),
         Parameter("T2", unit="ms", required=False, default_value=None),    
         )
 
@@ -34,6 +35,7 @@ class Cylinder(BaseCompartment):
         Also includes microstructural params:
             - D
             - Radius
+            - Direction
             - T2 (may be None)
         """
         # ---- 1. Required 'shells' argument ----
@@ -49,6 +51,7 @@ class Cylinder(BaseCompartment):
 
         shells_raw = params["shells"]
         shells_arr, n_shells = normalize_shells(shells_raw)
+        G_all, Delta_all, delta_all = shells_arr
 
         if "g_dirs" not in params:
             raise ValueError(
@@ -73,168 +76,219 @@ class Cylinder(BaseCompartment):
         # allow override via params, otherwise use instance values
         radius = self.values.get("radius",None)
         D = self.values.get("D",None)
+        dirs_raw = self.values.get("dir")
+
+        cyl_dirs_arr, n_cyl_dirs = normalize_gradients(dirs_raw)
 
         if radius is None or D is None:
             raise ValueError(
                 f"Missing microstructural parameters D and/or radius for compartment '{self.name}'. "
                 f"Pass them when instantiating the object."
             )
-
-        radius_clip = np.clip(radius,MINIMUM_RADIUS,None)
-
-        # ---- 5. Compute the signal shape ----
-        # Internal axis order: (n_shells, n_TE, n_dirs)
-        # If TE_arr is None: treat n_TE = 1 but you can omit decay or set TE=0
-
-        signal = np.zeros((n_shells, n_TE, n_dirs), dtype=float)
         
-        for i_shell in range(n_shells):
-            shell_info = shells_arr[:, i_shell]  # shape (3,)
-            G, Delta, delta = shell_info    
-            for i_TE in range(n_TE):
-                TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                for i_dir in range(n_dirs):
-                    G_T_per_micron = G * 1e-3 * 1e-6  # [T] * [um]^-1
-                    am_r = am[:, np.newaxis] / radius_clip
-                    GPDsum = compute_GPDsum(am_r,delta,Delta,D,radius_clip)
-                    
-                    gvec = grad_arr[i_dir]
-                    c2 = gvec[...,2]**2  # cosine^2 of angle between bvec and cylinder orientation
-                    s2 = 1-c2          # sine^2
+        radius = np.atleast_1d(radius).astype(float)
+        D = np.atleast_1d(D).astype(float)
 
-                    b = calc_bval(G,delta,Delta)
-                    log_att_perp = -2. * gamma_ms ** 2 * G_T_per_micron ** 2 * GPDsum * s2
-                    log_att_para = -b * D * c2
-                    if T2 is None:
-                        signal[i_shell,i_TE,i_dir] = np.exp(log_att_perp + log_att_para)
-                    else:
-                        T2_decay = np.exp(-TE_val/T2)
-                        signal[i_shell,i_TE,i_dir] = np.exp(log_att_perp + log_att_para) * T2_decay
+        if np.isscalar(T2) or T2 is None:
+            if T2 is None:
+                T2_arr = None
+                n_T2 = 1
+            else:
+                T2_arr = np.atleast_1d(float(T2))         # shape (1,)
+                n_T2 = 1
+        else:
+            T2_arr = np.atleast_1d(T2).astype(float)      # shape (n_T2,)
+            n_T2 = T2_arr.size
 
-        # remove dimensions of length 1
-        return np.squeeze(signal)
-    
-    def predict_mean(self, **params: Any) -> np.ndarray:
-        """
-        Expected keys in params:
-            - shells (required): (3, N) array
-            - TE (optional): scalar or 1D
+        n_radii = radius.size
+        n_Ds = D.size
 
-        Also includes microstructural params:
-            - D
-            - Radius
-            - T2 (may be None)
-        """
+        # Precompute direction-related terms
+        # Normalize cylinder directions (just in case)
+        cyl_norm = np.linalg.norm(cyl_dirs_arr, axis=1, keepdims=True) + 1e-12
+        cyl_dirs_unit = cyl_dirs_arr / cyl_norm  # (n_cyl_dirs, 3)
 
-        # ---- 1. Required 'shells' argument ----
-        if "shells" not in params:
-            raise ValueError(
-                f"'shells' argument is required in predict_mean() for {self.name}"
-            )
-        shells_raw = params["shells"]
-        shells_arr, n_shells = normalize_shells(shells_raw)
+        # Dot product between cyl_dirs_unit (k,3) and grad_arr (n_dirs,3)
+        # -> (k, n_dirs) via einsum:
+        cos_theta = np.einsum("kd,nd->kn", cyl_dirs_unit, grad_arr)
+        c2 = cos_theta**2            # (n_cyl_dirs, n_dirs)
+        s2 = 1.0 - c2                # (n_cyl_dirs, n_dirs)
 
-        # For restricted compartments, we require (3, N)
-        if shells_arr.ndim != 2 or shells_arr.shape[0] != 3:
-            raise ValueError(
-                f"'shells' must be a 2D array of shape (3, N) with rows [G, diffusion_time, pulse_duration] "
-                f"for compartment '{self.name}'. Got shape {shells_arr.shape}."
-            )
+        # Broadcast to final shape:
+        # We need (1, 1, n_cyl_dirs, 1, 1, 1, n_dirs)
+        c2_b = c2[None, None, :, None, None, None, :]     # (1, 1, k, 1, 1, 1, n_dirs)
+        s2_b = s2[None, None, :, None, None, None, :]     # same
 
-        if "g_dirs" in params:
-            raise ValueError(
-                f"'g_dirs' argument only valid when predict() is called for {self.name}"
-            )
+        # Precompute per-shell quantities
 
-        # ---- 2. TE handling, conditioned on T2 ----
-        T2 = self.values.get("T2", None)  # from self.values unless overridden
-        TE_raw = params.get("TE", None)
+        # G_all, Delta_all, delta_all: (n_shells,)
+        G_T_per_micron_all = G_all * 1e-3 * 1e-6   # (n_shells,)
+        G_T_all = G_T_per_micron_all               # name alias for clarity
 
-        if T2 is not None and TE_raw is None:
-            raise ValueError(
-                f"Compartment '{self.name}' requires TE when T2 is specified."
-            )
+        # b-values: (n_shells,)
+        b_all = calc_bval(G_all, delta_all, Delta_all)    # vectorised
 
-        TE_arr, n_TE = normalize_TE(TE_raw, n_shells)
+        # Reshape to broadcast as (..., n_shells,...)
+        G_T_b = G_T_all[None, None, None, None, :, None, None]  # (1,1,1,1,n_shells,1,1)
+        b_b = b_all[None, None, None, None, :, None, None]      # same
 
-        # ---- 4. Extract microstructural parameters ----
-        # allow override via params, otherwise use instance values
-        radius = self.values.get("radius",None)
-        D = self.values.get("D",None)
+        # Precompute GPDsum
+        radius_b = radius[:, None, None]            # (n_radii, 1, 1)
+        D_b = D[None, :, None]                      # (1, n_Ds, 1)
+        delta_b = delta_all[None, None, :]          # (1, 1, n_shells)
+        Delta_b = Delta_all[None, None, :]          # (1, 1, n_shells)
 
-        if radius is None or D is None:
-            raise ValueError(
-                f"Missing microstructural parameters D and/or radius for compartment '{self.name}'. "
-                f"Pass them when instantiating the object."
-            )
+        GPDsum = compute_GPDsum_broadcast(radius_b, D_b, delta_b, Delta_b)
+        # GPDsum: (n_radii, n_Ds, n_shells)
 
-        radius_clip = np.clip(radius, MINIMUM_RADIUS, None)
+        # Reshape for final broadcasting:
+        GPDsum_b = GPDsum[:, :, None, None, :, None, None]
+        # -> (n_radii, n_Ds, 1, 1, n_shells, 1, 1)
 
-        # ---- 5. Compute the signal shape ----
-        # Internal axis order: (n_shells, n_TE, n_dirs)
-        # If TE_arr is None: treat n_TE = 1 but you can omit decay or set TE=0
+        # --- 8. Combine terms to get log attenuation ---
 
-        signal = np.zeros((n_shells, n_TE), dtype=float)
+        # log_att_perp = -2 * gamma_ms^2 * G_T^2 * GPDsum * s2
+        log_att_perp = (
+            -2.0 * (gamma_ms**2)
+            * (G_T_b**2)
+            * GPDsum_b
+            * s2_b
+        )
+        # shape: (n_radii, n_Ds, n_cyl_dirs, 1, n_shells, 1, n_dirs)
 
-        for i_shell in range(n_shells):
-            shell_info = shells_arr[:, i_shell]  # shape (3,)
-            G, Delta, delta = shell_info 
-            for i_TE in range(n_TE):
-                TE_val = TE_arr[i_TE] if TE_arr is not None else None
-                G_T_per_micron = G * 1e-3 * 1e-6  # [T] * [um]^-1
-                am_r = am[:, np.newaxis] / radius_clip
-                GPDsum = compute_GPDsum(am_r,delta,Delta,D,radius_clip)
+        # log_att_para = -b * D * c2
+        D_b_full = D[None, :, None, None, None, None, None]
+        # -> (1, n_Ds, 1, 1, 1, 1, 1)
 
-                b_val = calc_bval(G,delta,Delta)
+        log_att_para = -b_b * D_b_full * c2_b
+        # -> (n_radii, n_Ds, n_cyl_dirs, 1, n_shells, 1, n_dirs) via broadcast
 
-                A = 2.0 * gamma_ms**2 * G_T_per_micron**2 * GPDsum
-                B = b_val * D
+        log_att = log_att_perp + log_att_para
 
-                def integrand(mu):
-                    return np.exp(-A * (1 - mu**2) - B * mu**2)
+        # --- 9. T2 decay broadcasting ---
 
-                integral, _ = quad(integrand, 0.0, 1.0, epsabs=1e-9, epsrel=1e-8)
+        if T2_arr is None:
+            # no T2 decay
+            signal = np.exp(log_att)
+        else:
+            # T2_arr: (n_T2,)
+            # TE_arr: (n_TE,)
+            # want T2_decay: (n_T2, n_shells, n_TE)
+            T2_arr_b = T2_arr[:, None, None]          # (n_T2, 1, 1)
+            TE_arr_b = TE_arr[None, None, :]          # (1, 1, n_TE)
 
-                if T2 is None:
-                    signal[i_shell,i_TE] = integral
-                else:
-                    T2_decay = np.exp(-TE_val/T2)
-                    signal[i_shell,i_TE] = integral * T2_decay
+            # TE may differ per shell; if normalize_TE already handles this
+            # and TE_arr is actually (n_shells, n_TE), just adapt shapes.
+            # Assuming TE_arr: (n_TE,) same for all shells:
+            T2_decay = np.exp(-TE_arr_b / T2_arr_b)   # (n_T2, 1, n_TE)
 
-        # remove dimensions of length 1
+            # Broadcast to full shape:
+            T2_decay_b = T2_decay[None, None, None, :, None, :, None]
+            # (1,1,1,n_T2,1,n_TE,1)
+
+            signal = np.exp(log_att) * T2_decay_b
+
         return np.squeeze(signal)
     
 # From Camino source
-#  60 first roots from the equation (am*x)j3/2'(am*x)- 1/2 J3/2(am*x)=0
-am = np.array([2.08157597781810, 5.94036999057271, 9.20584014293667,
-               12.4044450219020, 15.5792364103872, 18.7426455847748,
-               21.8996964794928, 25.0528252809930, 28.2033610039524,
-               31.3520917265645, 34.4995149213670, 37.6459603230864,
-               40.7916552312719, 43.9367614714198, 47.0813974121542,
-               50.2256516491831, 53.3695918204908, 56.5132704621986,
-               59.6567290035279, 62.8000005565198, 65.9431119046553,
-               69.0860849466452, 72.2289377620154, 75.3716854092873,
-               78.5143405319308, 81.6569138240367, 84.7994143922025,
-               87.9418500396598, 91.0842274914688, 94.2265525745684,
-               97.3688303629010, 100.511065295271, 103.653261271734,
-               106.795421732944, 109.937549725876, 113.079647958579,
-               116.221718846033, 116.221718846033, 119.363764548757,
-               122.505787005472, 125.647787960854, 128.789768989223,
-               131.931731514843, 135.073676829384, 138.215606107009,
-               141.357520417437, 144.499420737305, 147.641307960079,
-               150.783182904724, 153.925046323312, 157.066898907715,
-               166.492397790874, 169.634212946261, 172.776020008465,
-               175.917819411203, 179.059611557741, 182.201396823524,
-               185.343175558534, 188.484948089409, 191.626714721361])
-    
+# 60 first roots from the equation j'1(am*x)=0 */
+am = np.array([
+    1.84118307861360, 5.33144196877749, 8.53631578218074,
+    11.7060038949077, 14.8635881488839, 18.0155278304879,
+    21.1643671187891, 24.3113254834588, 27.4570501848623,
+    30.6019229722078, 33.7461812269726, 36.8899866873805,
+    40.0334439409610, 43.1766274212415, 46.3195966792621,
+    49.4623908440429, 52.6050411092602, 55.7475709551533,
+    58.8900018651876, 62.0323477967829, 65.1746202084584,
+    68.3168306640438, 71.4589869258787, 74.6010956133729,
+    77.7431620631416, 80.8851921057280, 84.0271895462953,
+    87.1691575709855, 90.3110993488875, 93.4530179063458,
+    96.5949155953313, 99.7367932203820, 102.878653768715,
+    106.020498619541, 109.162329055405, 112.304145672561,
+    115.445950418834, 118.587744574512, 121.729527118091,
+    124.871300497614, 128.013065217171, 131.154821965250,
+    134.296570328107, 137.438311926144, 140.580047659913,
+    143.721775748727, 146.863498476739, 150.005215971725,
+    153.146928691331, 156.288635801966, 159.430338769213,
+    162.572038308643, 165.713732347338, 168.855423073845,
+    171.997111729391, 175.138794734935, 178.280475036977,
+    181.422152668422, 184.563828222242, 187.705499575101])
+
 def compute_GPDsum(am_r, pulse_duration, diffusion_time, diffusivity, radius):
     dam = diffusivity * am_r * am_r
-    e11 = -dam * pulse_duration
-    e2 = -dam * diffusion_time
-    dif = diffusion_time - pulse_duration
-    e3 = -dam * dif
-    plus = diffusion_time + pulse_duration
-    e4 = -dam * plus
-    nom = 2 * dam * pulse_duration - 2 + (2 * np.exp(e11)) + (2 * np.exp(e2)) - np.exp(e3) - np.exp(e4)
-    denom = dam ** 2 * am_r ** 2 * (radius ** 2 * am_r ** 2 - 2)
-    return np.sum(nom / denom)
+    e11 = - dam * pulse_duration
+    e2  = - dam * diffusion_time
+    # dif = diffusion_time - pulse_duration
+    e3 = e2-e11 #- np.outer(dam, dif)
+    # plus = diffusion_time + pulse_duration
+    e4 = e2+e11 #- np.outer(dam, plus)
+
+    nom = -2 * e11 - 2 + \
+          (2 * np.exp(e11)) + \
+          (2 * np.exp(e2)) - np.exp(e3) - np.exp(e4)
+    denom = dam ** 2 * am_r ** 2 * (radius ** 2 * am_r ** 2 - 1)
+    return np.sum(nom / denom, axis=0)
+
+def compute_GPDsum_broadcast(radius, diffusivity, pulse_duration, diffusion_time):
+    """
+    radius        : (n_radii, 1, 1)      # in µm
+    diffusivity   : (1, n_D, 1)          # in µm^2/ms
+    pulse_duration: (1, 1, n_shells)     # delta, in ms
+    diffusion_time: (1, 1, n_shells)     # Delta, in ms
+
+    Returns:
+        GPDsum: (n_radii, n_D, n_shells)
+    """
+
+    # radius: (n_radii, 1, 1)
+    # diffusivity: (1, n_D, 1)
+    # pulse_duration, diffusion_time: (1, 1, n_shells)
+    #
+    # Build am_r = am / radius with a root axis at the end.
+
+    # am: (n_roots,) -> (1, 1, 1, n_roots)
+    am_vec = am[None, None, None, :]
+
+    # radius: (n_radii, 1, 1) -> (n_radii, 1, 1, 1)
+    radius4 = radius[..., None]
+
+    # am_r: (n_radii, 1, 1, n_roots)
+    am_r = am_vec / radius4
+
+    # diffusivity: (1, n_D, 1) -> (1, n_D, 1, 1)
+    D4 = diffusivity[..., None]
+
+    # pulse_duration, diffusion_time: (1, 1, n_shells) -> (1, 1, n_shells, 1)
+    delta4 = pulse_duration[..., None]
+    Delta4 = diffusion_time[..., None]
+
+    # dam: (n_radii, n_D, n_shells, n_roots)
+    dam = D4 * (am_r**2)
+
+    e11 = -dam * delta4
+    e2  = -dam * Delta4
+    dif = diffusion_time[..., None] - pulse_duration[..., None]  # or Delta4 - delta4
+    e3  = -dam * dif
+    plus = Delta4 + delta4
+    e4  = -dam * plus
+
+    nom = (
+        2.0 * dam * delta4
+        - 2.0
+        + 2.0 * np.exp(e11)
+        + 2.0 * np.exp(e2)
+        - np.exp(e3)
+        - np.exp(e4)
+    )
+
+    # denom: uses am_r and radius exactly as in scalar version
+    denom = (
+        dam**2
+        * am_r**2
+        * (radius4**2 * am_r**2 - 1.0)
+    )
+
+    GPDsum = np.sum(nom / denom, axis=-1)  # sum over roots
+    # shape: (n_radii, n_D, n_shells)
+
+    return GPDsum
