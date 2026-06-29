@@ -122,26 +122,28 @@ def calc_rotInvs(coeffs,l_vect,Lmax,normalise=True):
             Sl[:,i] = np.sqrt(denominator * np.sum(coeffs[:,l_vect == l]**2,axis=1))
             li[:,i] = l
 
-            return Sl, li
+    return Sl, li
 
 def get_invariants(signal, G_dirs, lmax):
     coeffs, m_vec, l_vec = fit_sh_coeffs(signal, G_dirs, lmax, normalise_basis=False)
-    invars, li = calc_rotInvs(coeffs, l_vec, lmax, normalise=True)
-    if coeffs.ndim==1:
+    if coeffs.shape[0]==1:
+        invars, li = calc_rotInvs(coeffs[0], l_vec, lmax, normalise=True)
         S0 = invars[0]   # spherical mean
         S2 = invars[1]   # spherical variance-like (should be ~0 at b=0)
-    elif coeffs.ndim==2:
+    else:
+        invars, li = calc_rotInvs(coeffs, l_vec, lmax, normalise=True)
         S0 = invars[:,0]
         S2 = invars[:,1]
     return S0, S2
 
 def get_reg_invariants(signal, G_dirs, lmax, lb_lambda):
     coeffs, m_vec, l_vec = fit_reg_sh_coeffs(signal, G_dirs, lmax, lb_lambda, normalise_basis=False)
-    invars, li = calc_rotInvs(coeffs, l_vec, lmax, normalise=True)
-    if coeffs.ndim==1:
+    if coeffs.shape[0]==1:
+        invars, li = calc_rotInvs(coeffs[0], l_vec, lmax, normalise=True)
         S0 = invars[0]   # spherical mean
         S2 = invars[1]   # spherical variance-like (should be ~0 at b=0)
-    elif coeffs.ndim==2:
+    else:
+        invars, li = calc_rotInvs(coeffs, l_vec, lmax, normalise=True)
         S0 = invars[:,0]
         S2 = invars[:,1]
     return S0, S2
